@@ -1,0 +1,134 @@
+---
+title: "*Tetrahymena* p-hacking"
+output: html_document
+date: "2026-09-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We will be needing the tidyverse
+```{r}
+library(tidyverse)
+```
+
+Step 1 of the masterplan is to load in the data. We are using the OurWorldInData COVID dataset and the OurWorldInData maize production dataset.
+
+```{r}
+covid_df <- read_csv("https://catalog.ourworldindata.org/garden/covid/latest/compact/compact.csv")
+
+maize_df <- maize <- read_csv("https://ourworldindata.org/explorers/global-food.csv?v=1&csvType=full&useColumnShortNames=true&Food=Maize+%28corn%29&Metric=Production&Per+capita=false")
+
+# Rename some of the columns to make our life easier later
+names(maize_df)[1] <- "country"
+names(maize_df)[length(names(maize))] <- "maize_prod"
+```
+
+For each country, we'll get average new cases per million people per day in 2021 and join this with maize production (in tonnes) from 1990.
+```{r}
+covid_df <-
+  covid_df %>%
+  filter(year(date) == 2021) %>%
+  select(country, new_cases_per_million) %>%
+  drop_na() %>%
+  group_by(country) %>%
+  summarise(total_new_cases_per_mil = sum(new_cases_per_million),
+            recorded_days = n(),
+            new_cases_per_day_mil = total_new_cases_per_mil/recorded_days)
+
+maize_df <-
+  maize_df %>%
+  filter(year == 1990)
+
+covid_df <-
+  left_join(covid_df, maize_df, by=("country")) %>%
+  select(country, new_cases_per_day_mil, maize_prod) %>%
+  drop_na()
+```
+
+Let's see what this relationship looks like
+```{r}
+covid_df %>% ggplot(aes(maize_prod, new_cases_per_day_mil)) +
+  geom_point()
+```
+
+That looks like it could use a log transformation on the x axis
+```{r}
+covid_df %>% ggplot(aes(maize_prod, new_cases_per_day_mil)) +
+  geom_point() +
+  scale_x_log10()
+```
+
+That's more like it. This looks like there's no relation, let's just confirm that
+```{r}
+check_lm <- lm(new_cases_per_day_mil ~ log(maize_prod), data=covid_df)
+summary(check_lm)
+```
+
+Having confirmed there is no true relationship, we'll now engage in egregious statistical malpractice.
+
+```{r}
+# We'll simulate the p-hacking where you stop collecting data when you get a significant p
+# Initialise our p_value from a model with 5 random countries
+set.seed(5678)
+covid_df_sample <- covid_df %>% slice_sample(n=5, replace=F)
+remaining_countries <- covid_df %>% filter(!(country %in% covid_df_sample$country))
+
+linmod <- lm(new_cases_per_day_mil ~ log(maize_prod), data=covid_df_sample)
+p <- summary(linmod)$coefficients["log(maize_prod)", "Pr(>|t|)"]
+i <- 0 # this will stop us getting trapped in the while loop forever
+while(p > 0.05 & i < 145){
+  # Sample one new country
+  sampled_country <- remaining_countries %>% slice_sample(n=1)
+  covid_df_sample <- rbind(covid_df_sample, sampled_country)
+  remaining_countries <- remaining_countries %>% filter(!(country %in% sampled_country$country))
+  
+  # Build a new linear model
+  linmod <- lm(new_cases_per_day_mil ~ log(maize_prod), data=covid_df_sample)
+  p <- summary(linmod)$coefficients["log(maize_prod)", "Pr(>|t|)"]
+  i <- i+1
+  print(p)
+}
+```
+
+We got a significant p-value after a few iterations. Let's plot the data we sampled:
+```{r}
+summary(linmod)
+
+covid_df_sample %>% ggplot(aes(maize_prod, new_cases_per_day_mil)) +
+  geom_point() +
+  geom_smooth(method="lm")
+```
+
+This looks kind of weird, let's commit more malpractice and remove the outlier.
+```{r}
+covid_df_sample_no_outliers <- covid_df_sample %>%
+  filter(maize_prod < 3e+06)
+
+linmod_no_outlier <- lm(new_cases_per_day_mil ~ log(maize_prod), data=covid_df_sample_no_outliers)
+summary(linmod_no_outlier)
+covid_df_sample_no_outliers %>% ggplot(aes(maize_prod, new_cases_per_day_mil)) +
+  geom_point() +
+  geom_smooth(method="lm")
+```
+
+Damn, that outlier was doing a lot for us. Let's commit more malpractice and put it back in now that we've seen the p-value from when we take it out.
+```{r}
+summary(linmod)
+
+covid_df_sample %>% ggplot(aes(maize_prod, new_cases_per_day_mil)) +
+  geom_point() +
+  geom_smooth(method="lm")
+```
+
+To recap, we:
+1. p-hacked by collecting data until we got a significant result (with significance threshold $\alpha = 0.05$)
+
+2. The subsequent dataset had a weird-looking outlier which we removed because it looked a bit funny
+
+3. That made our significant result disappear so we put it back in
+
+A short summary of our findings could be something along the lines of:
+
+Countries with higher maize production had significantly lower COVID infection rates (t=-2.254, p = 0.04206). We conclude maize has a protective effect against COVID and call for further research into possible mechanisms underlying this effect.
